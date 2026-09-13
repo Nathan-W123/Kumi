@@ -2705,6 +2705,18 @@ const CHANNEL_COMPLETED_WORK_PREFIX = "Already handled —";
 const ARBITRATION_NOTICE_PREFIX = "⚖️ ";
 
 /**
+ * How a contract-collision warning opens, as the gateway writes it.
+ *
+ * Mirrors `CHANNEL_CONTRACT_COLLISION_PREFIX`, and stripped for exactly the
+ * reason above: the line is the branch's own agent saying that something it
+ * is built on has moved on another branch, and it belongs in the bubble
+ * reading like everything else that agent says. Deliberately a different mark
+ * from the one above — the gateway retires the two on different conditions
+ * and the opening is how it tells them apart.
+ */
+const CONTRACT_COLLISION_NOTICE_PREFIX = "⚠️ ";
+
+/**
  * Protocol notices still carry their legacy symbol so older clients can
  * recognise them. The symbol is not shown: Kumi renders the matching mark
  * from the shared icon set, just like every other interface glyph — or, for
@@ -2715,6 +2727,10 @@ const NOTICE_ICONS = [
   { prefix: HOLD_NOTICE_PREFIX, marker: "⏸ ", iconName: "pause" },
   { prefix: PLAN_LAPSED_PREFIX, marker: "⌛ ", iconName: "clock" },
   { prefix: ARBITRATION_NOTICE_PREFIX, marker: ARBITRATION_NOTICE_PREFIX },
+  {
+    prefix: CONTRACT_COLLISION_NOTICE_PREFIX,
+    marker: CONTRACT_COLLISION_NOTICE_PREFIX,
+  },
 ];
 
 function messageBodyWithIcons(entry, repositoryId) {

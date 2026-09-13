@@ -67,6 +67,27 @@ export const CHANNEL_PLAN_LAPSED_PREFIX = "⌛ Plan expired";
  */
 export const CHANNEL_ARBITRATION_PREFIX = "⚖️";
 /**
+ * How a contract-collision line opens, and how it is found again.
+ *
+ * The same job {@link CHANNEL_ARBITRATION_PREFIX} does, and deliberately not
+ * the same mark. Both stand only while they are true and both are stripped by
+ * the browser, but they are true for different reasons and stop being true at
+ * different moments, so nothing may mistake one for the other.
+ *
+ * `isCoordinatorNotice` recognises an arbitration notice by that exact
+ * opening, and the hold machinery then replaces whatever it finds with the
+ * next hold and sweeps it once the thread's task has settled. A collision
+ * line sharing the opening would be swapped out by the next admission in the
+ * same thread, and swept the moment that task finished — which for this line
+ * is immediately, because a branch claim exists precisely because the task
+ * that wrote it integrated. The collision it names outlives the task by the
+ * whole life of the branch.
+ *
+ * A stored line carries its words and its thread and nothing else, so the
+ * opening is the only thing that can tell the two apart later.
+ */
+export const CHANNEL_CONTRACT_COLLISION_PREFIX = "⚠️";
+/**
  * How the advisory line ended, and so how one is still told from a hold.
  *
  * Nothing writes this line any more: two plans that overlap only in intent
