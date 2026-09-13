@@ -13,6 +13,18 @@
  * line has to be findable from the thread it hangs in as well as from memory,
  * and it has to retire on its own condition rather than on a sweep.
  *
+ * The contract-collision line is the same promise about a different fact, and
+ * lives here for that reason. "@Hades changed something this branch is built
+ * on" is true only while that branch is still holding the moved contract and
+ * this one is still built on it; the moment either branch merges, is deleted,
+ * or stops moving the contract, the line has to come down on exactly the
+ * argument above. What it reuses is the hard half — the thread an agent
+ * speaks in, the removal that is broadcast, and the rule that a line is
+ * findable from where it hangs rather than only from memory. What it cannot
+ * share is the end condition: a hold is over when its task stops, and a
+ * collision outlives its task by the whole life of a branch. That is why the
+ * two carry different marks; see {@link CHANNEL_CONTRACT_COLLISION_PREFIX}.
+ *
  * Split out of `ApiGateway` because it is exactly that — one promise, one
  * piece of state, and a boundary that fell where the code already was. What
  * it needs from the gateway is declared as {@link NoticeBoardHost} and
@@ -20,20 +32,32 @@
  * code touch" was a question you answered by reading fifteen thousand lines.
  */
 
-import type { ChannelMessage, SubmittedTask } from "@coord/persistence";
+import type {
+  BranchClaim,
+  ChannelMessage,
+  SubmittedTask,
+} from "@coord/persistence";
 
 import {
   arbitrationLine,
   arbitrationReleaseLine,
   type DeferredRef,
 } from "./arbitration-line.js";
+import {
+  collisionsAgainst,
+  contractCollisionLine,
+} from "./contract-collisions.js";
 import { isCoordinatorNotice } from "./gateway-util.js";
 import type { ApiGateway } from "./server.js";
 import {
   CHANNEL_ARBITRATION_PREFIX,
+  CHANNEL_CONTRACT_COLLISION_PREFIX,
   TASK_STATUSES_PAST_STOPPING,
   arbitrationNoticeKind,
 } from "./task-narration.js";
+
+/** How many recent messages a standing collision line is looked for in. */
+const COLLISION_NOTICE_SCAN = 40;
 
 /**
  * One arbitration line standing somewhere, and what it takes to take it back.
@@ -60,6 +84,46 @@ interface StandingArbitrationNotice {
    * still findable, but who it was about is no longer known.
    */
   alsoNamed: readonly string[];
+}
+
+/**
+ * One contract-collision line standing in a branch's thread.
+ *
+ * The branch it is about is deliberately not a field. A line is about the
+ * branch whose claim names the task whose thread it hangs in, and that is a
+ * fact the claims table answers now rather than one this process remembers —
+ * so a branch that has merged since simply stops resolving, which is the
+ * whole of how such a line is recognised as finished.
+ */
+interface StandingCollisionNotice {
+  projectId: string;
+  repositoryId: string;
+  /** The thread root the line replies inside. */
+  messageId: string;
+  /** The reply itself. Always set: there is no room-level form of this line. */
+  replyId?: string;
+  /** The task whose thread this is, and so the branch it speaks for. */
+  taskId: string;
+  content: string;
+}
+
+/**
+ * Is this entry one of the contract-collision lines?
+ *
+ * `agent` only, and not by accident: this line is always the consuming
+ * branch's own agent speaking in its own thread. There is no coordinator form
+ * of it to recognise, for the reason {@link
+ * ArbitrationNoticeBoard.announceContractCollisions} gives for staying quiet
+ * when no agent resolves.
+ */
+function isContractCollisionNotice(entry: {
+  kind: string;
+  content: string;
+}): boolean {
+  return (
+    entry.kind === "agent" &&
+    entry.content.startsWith(CHANNEL_CONTRACT_COLLISION_PREFIX)
+  );
 }
 
 /**
@@ -95,11 +159,28 @@ export class ArbitrationNoticeBoard {
     StandingArbitrationNotice
   >();
 
+  /**
+   * The contract-collision lines currently standing, by the id of the reply
+   * carrying each.
+   *
+   * The same fast path with the same caveat as the map above, and one reason
+   * of its own to exist: the thread scan below reads a fixed window of recent
+   * messages, and a branch whose thread has scrolled out of that window would
+   * otherwise look like a branch that had never been warned — so the warning
+   * would be posted a second time, which is the one failure this feature
+   * cannot afford.
+   */
+  private readonly collisionNotices = new Map<
+    string,
+    StandingCollisionNotice
+  >();
+
   public constructor(private readonly host: NoticeBoardHost) {}
 
   /** Dropped on shutdown; every line is still findable from its thread. */
   public clear(): void {
     this.arbitrationNotices.clear();
+    this.collisionNotices.clear();
   }
 
   /**
@@ -558,6 +639,252 @@ export class ArbitrationNoticeBoard {
         messageId: notice.messageId,
       },
     });
+  }
+
+  /**
+   * Tells each branch what another branch has just moved underneath it.
+   *
+   * This is the collision git has no opinion about. One branch changes what
+   * an exported contract *is* and another goes on calling it the old way;
+   * neither edited the other's lines, so both merge cleanly and the build
+   * breaks afterwards in a file neither of them touched. Everything needed to
+   * see it coming has been recorded on the branch claims for as long as they
+   * have existed, and until now nothing read it.
+   *
+   * Recomputed for the whole repository rather than for the branch that just
+   * landed, because the branch that is about to be broken is somebody else's:
+   * the news is made by the mover and is only of use to the consumer. Both
+   * halves come out of one join over every claim the repository holds, so the
+   * same pass that writes a new line is the pass that takes back one that has
+   * stopped being true — a branch that merged or was deleted has had its
+   * claims released, a contract that stopped being moved is recorded as
+   * unmoved, and either way the sentence this produces changes or disappears.
+   *
+   * One standing line per branch, and an identical one is never written
+   * twice. That is not tidiness: a warning that repeats is a warning people
+   * turn off, and this one has to survive being seen every day.
+   */
+  public async announceContractCollisions(input: {
+    projectId: string;
+    repositoryId: string;
+  }): Promise<void> {
+    const { projectId, repositoryId } = input;
+    const claims = await this.host.options.store
+      .listBranchClaims(repositoryId)
+      .catch((): BranchClaim[] => []);
+    // The thread that speaks for a branch is the one that last landed on it.
+    // A branch collects a claim per task, and the newest is the work whose
+    // thread the person following that branch actually has open.
+    const speakingClaim = new Map<string, BranchClaim>();
+    const branchOfTask = new Map<string, string>();
+    for (const claim of claims) {
+      speakingClaim.set(claim.branch, claim);
+      branchOfTask.set(claim.taskId, claim.branch);
+    }
+    const collisions = new Map(
+      [...speakingClaim.keys()].map(
+        (branch) => [branch, collisionsAgainst(branch, claims)] as const,
+      ),
+    );
+    const standing = await this.standingCollisionNotices(repositoryId);
+    if (
+      standing.length === 0 &&
+      [...collisions.values()].every((found) => found.length === 0)
+    ) {
+      // Nothing to say and nothing standing, which is nearly every repository
+      // nearly always. Answered before a name is resolved, because resolving
+      // them reads the task list, the channel overrides and the connections —
+      // three queries to decide that a quiet repository is quiet.
+      return;
+    }
+    const describe = await this.host.channelAgentNamer(projectId, repositoryId);
+    // Branches are named the way the room names the work on them, not by ref.
+    // A reader who has been watching "@Hades" all morning is not helped by
+    // being told that `feat/payments-v2` moved something, and the resolver is
+    // the one the holds already use — including its fallback to the quoted
+    // objective when no agent account can be matched, which is still a thing
+    // the reader recognises.
+    const nameOfBranch = (branch: string): string => {
+      const claim = speakingClaim.get(branch);
+      return claim === undefined ? branch : describe.name(claim.taskId);
+    };
+    const wanted = new Map<string, string>();
+    for (const [branch, found] of collisions) {
+      const sentence = contractCollisionLine(found, nameOfBranch);
+      if (sentence !== undefined) {
+        wanted.set(branch, `${CHANNEL_CONTRACT_COLLISION_PREFIX} ${sentence}`);
+      }
+    }
+    const byBranch = new Map<string, StandingCollisionNotice[]>();
+    for (const notice of standing) {
+      const branch = branchOfTask.get(notice.taskId);
+      if (branch === undefined) {
+        // The thread's task holds no claim any more, so the branch it spoke
+        // for has merged or gone. Nothing is built on it and nothing it moved
+        // is still in flight; the line is the only thing left saying
+        // otherwise.
+        await this.dropCollisionNotice(notice);
+        continue;
+      }
+      byBranch.set(branch, [...(byBranch.get(branch) ?? []), notice]);
+    }
+    for (const [branch, notices] of byBranch) {
+      const content = wanted.get(branch);
+      // Already saying exactly this. Nothing happens — not a delete and a
+      // rewrite, which every reader of the thread would see as the same
+      // warning being given again.
+      const kept =
+        content === undefined
+          ? undefined
+          : notices.find((notice) => notice.content === content);
+      for (const notice of notices) {
+        if (notice !== kept) {
+          await this.dropCollisionNotice(notice);
+        }
+      }
+      if (kept !== undefined) {
+        wanted.delete(branch);
+      }
+    }
+    for (const [branch, content] of wanted) {
+      const claim = speakingClaim.get(branch);
+      if (claim === undefined) {
+        continue;
+      }
+      await this.postCollisionNotice({
+        projectId,
+        repositoryId,
+        taskId: claim.taskId,
+        content,
+      });
+    }
+  }
+
+  /**
+   * The same reconciliation for every repository, on the sweep's clock.
+   *
+   * The live path runs when work lands, which covers a contract moving and a
+   * contract settling back down. It does not cover the two endings that are
+   * not events here at all: a branch merged and a branch deleted both just
+   * stop having claims, quietly, and a room whose last promotion was
+   * yesterday would keep a warning about a branch that no longer exists until
+   * somebody happened to land something else in it.
+   */
+  public async reconcileContractCollisions(): Promise<void> {
+    const repositories = await this.host.options.store.listRepositories();
+    for (const repository of repositories) {
+      // The project is read off the room, because the repository row does not
+      // carry one. A repository with no messages has no thread for a line to
+      // stand in, which also means it has none standing.
+      const projectId = (
+        await this.host.options.store
+          .listChannelMessages(repository.id, "", { limit: 1 })
+          .catch((): ChannelMessage[] => [])
+      )[0]?.projectId;
+      if (projectId === undefined) {
+        continue;
+      }
+      await this.announceContractCollisions({
+        projectId,
+        repositoryId: repository.id,
+      }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Every collision line standing in one repository, however it got there.
+   *
+   * The threads first, because they are the record: a line routinely outlives
+   * the process that wrote it, and after a restart the reply is the only
+   * evidence it exists. Memory then fills in the threads the window did not
+   * reach — and is pruned where the window says a line this process posted is
+   * no longer in the thread, because a line somebody deleted by hand must not
+   * be remembered as standing or its branch would never be warned again.
+   */
+  private async standingCollisionNotices(
+    repositoryId: string,
+  ): Promise<StandingCollisionNotice[]> {
+    const messages = await this.host.options.store
+      .listChannelMessages(repositoryId, "", { limit: COLLISION_NOTICE_SCAN })
+      .catch((): ChannelMessage[] => []);
+    const found = new Map<string, StandingCollisionNotice>();
+    for (const message of messages) {
+      const taskId = message.taskId;
+      if (taskId === undefined) {
+        continue;
+      }
+      for (const reply of message.replies ?? []) {
+        if (!isContractCollisionNotice(reply)) {
+          continue;
+        }
+        found.set(reply.id, {
+          projectId: message.projectId,
+          repositoryId,
+          messageId: message.id,
+          replyId: reply.id,
+          taskId,
+          content: reply.content,
+        });
+      }
+    }
+    const scanned = new Set(messages.map((message) => message.id));
+    for (const [id, notice] of this.collisionNotices) {
+      if (notice.repositoryId !== repositoryId || found.has(id)) {
+        continue;
+      }
+      if (scanned.has(notice.messageId)) {
+        this.collisionNotices.delete(id);
+        continue;
+      }
+      found.set(id, notice);
+    }
+    return [...found.values()];
+  }
+
+  /** One collision line, in the thread of the branch it is a warning to. */
+  private async postCollisionNotice(input: {
+    projectId: string;
+    repositoryId: string;
+    taskId: string;
+    content: string;
+  }): Promise<void> {
+    const speaker = await this.arbitrationNoticeThread(input).catch(
+      () => undefined,
+    );
+    if (speaker === undefined) {
+      // No thread, or no agent account behind it. Said nowhere rather than in
+      // the room, which is the one place this differs from a hold: the
+      // sentence is addressed to the branch's own reader — "something this
+      // branch is built on" means something only where the reader already
+      // knows which branch they are looking at — and the room's copy would be
+      // a warning about a branch it cannot name. Nobody is blocked by the
+      // silence, and the next recompute posts it once a thread exists.
+      return;
+    }
+    const reply = await this.host.appendChannelThreadReply({
+      projectId: input.projectId,
+      repositoryId: input.repositoryId,
+      messageId: speaker.messageId,
+      kind: "agent",
+      authorId: speaker.authorId,
+      content: input.content,
+    });
+    this.collisionNotices.set(reply.id, {
+      projectId: input.projectId,
+      repositoryId: input.repositoryId,
+      messageId: speaker.messageId,
+      replyId: reply.id,
+      taskId: input.taskId,
+      content: input.content,
+    });
+  }
+
+  /** One collision line taken back, by the same removal a hold uses. */
+  private async dropCollisionNotice(
+    notice: StandingCollisionNotice,
+  ): Promise<void> {
+    await this.dropArbitrationNotice(notice).catch(() => undefined);
+    this.collisionNotices.delete(notice.replyId ?? notice.messageId);
   }
 
   /**

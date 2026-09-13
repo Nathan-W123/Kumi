@@ -1886,12 +1886,19 @@ export class ApiGateway {
     // to merge into. See `refreshDriftingBranches` — most conflicts are drift,
     // and drift is the one kind that gets worse the longer nobody looks.
     void this.refreshDriftingBranches().catch(() => undefined);
+    // And the sixth: the contract-collision lines, whose two endings are not
+    // events at all. A branch that merged and a branch that was deleted both
+    // simply stop having claims, so nothing wakes to withdraw the warning
+    // about them — see `announceContractCollisions`, which is also the live
+    // path and reconciles the same way from the same join.
+    void this.reconcileContractCollisions().catch(() => undefined);
     this.threadReconcileTimer = setInterval(() => {
       void this.reconcileFinishedThreads().catch(() => undefined);
       void this.reconcileArbitrationNotices().catch(() => undefined);
       void this.lapseStalePlanHolds().catch(() => undefined);
       void this.reportStalledTasks().catch(() => undefined);
       void this.refreshDriftingBranches().catch(() => undefined);
+      void this.reconcileContractCollisions().catch(() => undefined);
     }, this.options.threadReconcileIntervalMs ?? THREAD_RECONCILE_INTERVAL_MS);
     this.threadReconcileTimer.unref?.();
   }
@@ -10993,6 +11000,24 @@ export class ApiGateway {
   }
 
   /**
+   * The warning two branches on a collision course cannot give each other.
+   *
+   * Forwards for the same reason the four above do. See
+   * `contract-collisions.ts` for the join and `arbitration-notices.ts` for
+   * why the line retires the way a hold does.
+   */
+  private async announceContractCollisions(input: {
+    projectId: string;
+    repositoryId: string;
+  }): Promise<void> {
+    await this.notices.announceContractCollisions(input);
+  }
+
+  private async reconcileContractCollisions(): Promise<void> {
+    await this.notices.reconcileContractCollisions();
+  }
+
+  /**
    * The agent's own account of a canonical-moved replan.
    *
    * Names the winner by looking up which task's promotion produced the
@@ -11339,6 +11364,23 @@ export class ApiGateway {
               : record.event.type === "replan_requested" &&
                 typeof data["revision"] === "string" &&
                 (await this.announceReplay(watched, data).catch(() => false));
+          // Work has just landed on a branch, so what that branch is holding
+          // has changed — and so has what it is about to break in somebody
+          // else's. The claim the coordinator writes at settlement carries
+          // the contracts this branch moved and the files that were built on
+          // them; this is the moment those become news. Recomputed for every
+          // branch in the repository rather than for this one, because the
+          // branch that needs telling is never the branch that moved.
+          //
+          // Best effort and never in the way of the ending: a warning that
+          // failed to post is recovered by the sweep, and an ending held up
+          // behind one would be the run going quiet for the wrong reason.
+          if (record.event.type === "canonical_promoted") {
+            await this.announceContractCollisions({
+              projectId: watched.projectId,
+              repositoryId: watched.repositoryId,
+            }).catch(() => undefined);
+          }
           // Answer the thread marker when the gate is decided, wherever it
           // was decided. A reviewer clearing it from the Approvals screen
           // never posts a reply, so the audit stream supplies the matching

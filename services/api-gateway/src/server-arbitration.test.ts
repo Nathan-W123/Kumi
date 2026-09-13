@@ -1794,6 +1794,500 @@ test("an advisory line an older deployment left behind is still swept", async (t
   );
 });
 
+/**
+ * Every contract-collision warning standing in a repository, and whose thread.
+ *
+ * The reply id is part of the answer on purpose: "one line, unchanged" and
+ * "one line, deleted and written again" look identical from the content alone,
+ * and only one of them is a room that stays readable.
+ */
+async function collisionLines(
+  runtime: TestRuntime,
+  repositoryId: string,
+  viewerId: string,
+): Promise<
+  { id: string; taskId: string | undefined; authorId: string; content: string }[]
+> {
+  const messages = await runtime.store.listChannelMessages(
+    repositoryId,
+    viewerId,
+  );
+  return messages.flatMap((message) =>
+    (message.replies ?? [])
+      .filter((reply) => reply.content.startsWith("⚠️"))
+      .map((reply) => ({
+        id: reply.id,
+        taskId: message.taskId,
+        authorId: reply.authorId,
+        content: reply.content,
+      })),
+  );
+}
+
+/**
+ * The collision this whole feature exists for, as two branch claims.
+ *
+ * `payments` left `sign` as something else and recorded that `src/login.ts`
+ * was built on it; `login` has `src/login.ts` open. Git will merge both
+ * without a murmur.
+ */
+async function branchesOnACollisionCourse(
+  runtime: TestRuntime,
+  repo: string,
+  tasks: { claude: string; codex: string },
+): Promise<void> {
+  await runtime.store.recordBranchClaim({
+    repositoryId: repo,
+    branch: "payments",
+    taskId: tasks.codex,
+    revision: "rev-payments",
+    shapes: [
+      {
+        file: "src/auth.ts",
+        symbol: "sign",
+        shape: "(password: number): string",
+        digest: "after",
+        moved: true,
+        consumers: ["src/login.ts"],
+      },
+    ],
+  });
+  await runtime.store.recordBranchClaim({
+    repositoryId: repo,
+    branch: "login",
+    taskId: tasks.claude,
+    revision: "rev-login",
+    ranges: [{ file: "src/login.ts", start: 1, end: 40 }],
+  });
+}
+
+/** The sweep that reconciles collision lines, reached the way the gateway does. */
+function collisionSweep(runtime: TestRuntime): () => Promise<void> {
+  return async () => {
+    await (
+      runtime.gateway as unknown as {
+        reconcileContractCollisions(): Promise<void>;
+      }
+    ).reconcileContractCollisions();
+  };
+}
+
+test("a branch is warned, in its own thread, that a contract under it moved", async (t) => {
+  // The gap this closes: the detector could name this collision and nothing
+  // ever said it out loud. One branch changes what `sign` is, another goes on
+  // calling it the old way, git merges both cleanly, and the build breaks
+  // afterwards in a file neither branch touched. The person who needs to know
+  // is on the branch that did not move anything — so the line goes in their
+  // thread, not the mover's.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "contractroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+
+  // Work landing on a branch is what makes this news, and it is the event the
+  // gateway already watches. Nothing else is appended: if the warning needs a
+  // sweep to appear, it is not wired to anything a person would notice.
+  await runtime.store.appendAudit(undefined, {
+    type: "canonical_promoted",
+    taskId: tasks.claude,
+    data: {
+      projectId: DEFAULT_PROJECT_ID,
+      repositoryId: repo,
+      previousRevision: "rev-before",
+      revision: "rev-login",
+      files: ["src/login.ts"],
+    },
+  });
+  await waitFor(
+    async () => (await collisionLines(runtime, repo, ownerId)).length > 0,
+    "the collision was never announced",
+    8_000,
+  );
+
+  const lines = await collisionLines(runtime, repo, ownerId);
+  assert.equal(lines.length, 1, JSON.stringify(lines));
+  const [line] = lines;
+  assert.equal(
+    line?.taskId,
+    tasks.claude,
+    "the warning went to the branch that moved the contract, not the one built on it",
+  );
+  assert.equal(
+    line?.authorId,
+    `${ownerId}:anthropic`,
+    "the warning was not spoken by the warned branch's own agent",
+  );
+  // Named the way the room names it, not by ref. A reader who has been
+  // watching @Codex all morning is not helped by `payments`.
+  assert.equal(
+    line?.content,
+    `⚠️ @Codex (${firstName}) changed something this branch is built on: ` +
+      "`sign` in src/auth.ts — src/login.ts uses it. Git will merge these " +
+      "cleanly — none of it will show up as a conflict.",
+    "the warning did not say what moved, where, or that git will not catch it",
+  );
+});
+
+test("the branch that moved the contract is not the one told about it", async (t) => {
+  // The other half of the test above, and the half that is silence. A
+  // collision has two branches in it and only one of them is about to break:
+  // the mover already knows what it changed, and a warning in its thread
+  // would be the news going to the one person who cannot act on it. Here the
+  // mover is the branch with a thread and the consumer is the one without —
+  // so anything posted at all is posted to the wrong branch.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "moverroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  // The same two claims as the test above, with the branches swapped: the
+  // thread in this room belongs to the branch that moved `sign`.
+  await branchesOnACollisionCourse(runtime, repo, {
+    claude: tasks.codex,
+    codex: tasks.claude,
+  });
+
+  await collisionSweep(runtime)();
+  assert.deepEqual(
+    await collisionLines(runtime, repo, ownerId),
+    [],
+    "the branch that changed the contract was told its own news",
+  );
+});
+
+test("the same collision is not announced a second time", async (t) => {
+  // The single most important thing after being right. A warning that repeats
+  // is a warning people turn off, and this one is recomputed from the claims
+  // on every promotion and every sweep — so "unchanged" has to mean the reply
+  // that is already there is left exactly where it is, not deleted and
+  // written again under a new id.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "repeatroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+  const sweep = collisionSweep(runtime);
+
+  await sweep();
+  const first = await collisionLines(runtime, repo, ownerId);
+  assert.equal(first.length, 1, JSON.stringify(first));
+
+  await sweep();
+  await sweep();
+  assert.deepEqual(
+    await collisionLines(runtime, repo, ownerId),
+    first,
+    "the warning was posted again, or taken down and rewritten",
+  );
+});
+
+test("the warning goes when the branch that moved the contract merges", async (t) => {
+  // Merging releases what a branch was holding, which is exactly when this
+  // stops being true: everybody has the new `sign` now. A room full of stale
+  // warnings is worse than one that never spoke, because the reader cannot
+  // tell which of them still apply.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "mergedroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+  const sweep = collisionSweep(runtime);
+
+  await sweep();
+  assert.equal(
+    (await collisionLines(runtime, repo, ownerId)).length,
+    1,
+    "the collision was never announced",
+  );
+
+  // What merging a work channel does, and what deleting one does: whatever
+  // the branch was holding, it holds no longer.
+  await runtime.store.releaseBranchClaims(repo, "payments");
+  await sweep();
+  assert.deepEqual(
+    await collisionLines(runtime, repo, ownerId),
+    [],
+    "the warning outlived the collision it described",
+  );
+});
+
+test("a contract that stopped moving stops being a warning", async (t) => {
+  // The other ending, and the one that is not a branch disappearing: the
+  // moving branch is re-read and `sign` now matches canonical. Nothing
+  // announces that — it is simply what the next claim says — so the line has
+  // to retire on the recomputed answer rather than on an event.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "settledroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+  const sweep = collisionSweep(runtime);
+
+  await sweep();
+  assert.equal(
+    (await collisionLines(runtime, repo, ownerId)).length,
+    1,
+    "the collision was never announced",
+  );
+
+  // Replaced rather than added to, which is how a branch claim is restated —
+  // two claims for one branch would describe two overlapping pasts.
+  await runtime.store.releaseBranchClaims(repo, "payments");
+  await runtime.store.recordBranchClaim({
+    repositoryId: repo,
+    branch: "payments",
+    taskId: tasks.codex,
+    revision: "rev-payments-2",
+    shapes: [
+      {
+        file: "src/auth.ts",
+        symbol: "sign",
+        shape: "(password: string): string",
+        digest: "before",
+        moved: false,
+        consumers: ["src/login.ts"],
+      },
+    ],
+  });
+  await sweep();
+  assert.deepEqual(
+    await collisionLines(runtime, repo, ownerId),
+    [],
+    "a contract back where canonical has it was still being warned about",
+  );
+});
+
+test("the warning goes when the branch it was warning is deleted", async (t) => {
+  // The other end of the same collision. A work channel that is abandoned
+  // rather than merged releases its branch's claims too, and the line hanging
+  // in its thread is then a warning to nobody about a branch that is gone —
+  // still sitting above the last thing that thread ever said.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "abandonedroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+  const sweep = collisionSweep(runtime);
+
+  await sweep();
+  assert.equal(
+    (await collisionLines(runtime, repo, ownerId)).length,
+    1,
+    "the collision was never announced",
+  );
+
+  await runtime.store.releaseBranchClaims(repo, "login");
+  await sweep();
+  assert.deepEqual(
+    await collisionLines(runtime, repo, ownerId),
+    [],
+    "a warning to a branch that no longer exists was left standing",
+  );
+});
+
+test("a restart still finds and takes back a warning it did not post", async (t) => {
+  // A branch outlives deployments the way a hold does, and the map recording
+  // which reply to delete dies with the process. So the line has to be
+  // findable from the thread it hangs in — otherwise the first branch warned
+  // across a deploy keeps that warning over its head for the rest of the
+  // thread's life, long after the collision is over.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "restartcontractroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+  const sweep = collisionSweep(runtime);
+
+  await sweep();
+  assert.equal(
+    (await collisionLines(runtime, repo, ownerId)).length,
+    1,
+    "the collision was never announced",
+  );
+
+  // What shutdown does: everything this process remembered about posting the
+  // line is gone, and only the reply itself is left.
+  (
+    runtime.gateway as unknown as { notices: { clear(): void } }
+  ).notices.clear();
+  await runtime.store.releaseBranchClaims(repo, "payments");
+  await sweep();
+  assert.deepEqual(
+    await collisionLines(runtime, repo, ownerId),
+    [],
+    "a warning this process had no memory of posting was left standing",
+  );
+});
+
+test("a hold and a contract warning stand in one thread without eating each other", async (t) => {
+  // Both are lines that stand only while they are true, both hang in the same
+  // agent's thread, and they end on opposite conditions — a hold as soon as
+  // its task stops, a collision for as long as two branches are on course.
+  // They are told apart by the mark they open with, and nothing else about a
+  // stored reply could tell them apart. Share a mark and the next admission
+  // silently replaces a live warning, and the hold sweep deletes it the
+  // moment the task settles — which for a branch claim is immediately, since
+  // the claim exists because the task integrated.
+  const runtime = await startRuntime(t);
+  const owner = new TestClient(runtime.origin);
+  const session = await bootstrap(owner);
+  const ownerId = session.user.id;
+  const firstName = String(session.user.displayName).split(" ")[0] ?? "Owner";
+  const repo = await invitableRepository(owner, "bothroom");
+  runtime.chatConnections.set(ownerId, [
+    { provider: "anthropic", visibility: "org" },
+    { provider: "openai", visibility: "org" },
+  ]);
+  await joinAllConnectedAgents(runtime, repo);
+  const tasks = await roomWithTwoAgents(
+    runtime,
+    owner,
+    repo,
+    ownerId,
+    firstName,
+  );
+  await branchesOnACollisionCourse(runtime, repo, tasks);
+  const sweep = collisionSweep(runtime);
+  await sweep();
+
+  await runtime.store.appendAudit(undefined, {
+    type: "plan_admitted",
+    taskId: tasks.claude,
+    data: {
+      status: "sequenced",
+      blockedBy: [tasks.codex],
+      explanation: "Sequenced behind executing work on the same resources",
+    },
+  });
+  await waitFor(
+    async () => (await arbitrationLines(runtime, repo, ownerId)).length > 0,
+    "the hold was never announced",
+    8_000,
+  );
+  assert.equal(
+    (await collisionLines(runtime, repo, ownerId)).length,
+    1,
+    "announcing a hold took back the contract warning in the same thread",
+  );
+
+  // And the other way: the hold's own sweep runs over the same thread once
+  // the work it named is gone, and must leave the warning standing.
+  await runtime.store.cancelSubmittedTask(tasks.codex);
+  await (
+    runtime.gateway as unknown as {
+      reconcileArbitrationNotices(): Promise<void>;
+    }
+  ).reconcileArbitrationNotices();
+  assert.deepEqual(
+    await arbitrationLines(runtime, repo, ownerId),
+    [],
+    "the hold survived the work it was waiting on",
+  );
+  assert.equal(
+    (await collisionLines(runtime, repo, ownerId)).length,
+    1,
+    "the hold sweep took the contract warning with it",
+  );
+});
+
 test("deleting a coordinator notice does not stop the task it names", async (t) => {
   // The notice carries a task id so a fresh process can find it again — and
   // the delete route stops the task behind any message it removes. A reader
