@@ -69,3 +69,32 @@ test("reduced motion removes spatial primary and secondary transitions", async (
   const css = await publicFile("styles.css");
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.primary-entering,[\s\S]*?\.thread-panel\.panel-entering[\s\S]*?animation: none;/u);
 });
+
+test("every panel's scroller takes the room its composer is not using", async () => {
+  // The panel is a column whose middle child grows. It used to be three named
+  // grid rows, and one rule at the foot of the stylesheet turned every panel
+  // into a flex column while handing `flex: 1` to the file panel alone. The
+  // other panels' bodies went on hugging their content, so a thread with two
+  // replies in it drew its composer under the second one — halfway up an
+  // empty panel, while the room's own composer sat on the floor beside it.
+  const css = await publicFile("styles.css");
+
+  // Said once, where the panel is built, so nothing downstream has to guess
+  // which of the two layouts is live.
+  // Bounded to the block: an unbounded `[\s\S]*?` reaches the next
+  // `grid-template-rows` anywhere in a fifteen-thousand-line stylesheet.
+  const panelBlock = css.slice(
+    css.indexOf("\n.thread-panel {"),
+    css.indexOf("}", css.indexOf("\n.thread-panel {")),
+  );
+  assert.match(panelBlock, /display: flex;\s*\n\s*flex-direction: column;/u);
+  assert.doesNotMatch(panelBlock, /grid-template-rows:/u);
+
+  // And the growing child is named against the shape every panel shares, not
+  // against one panel that happened to be looked at.
+  assert.match(
+    css,
+    /\n\.thread-panel > \.thread-body,\n\.agent-detail-panel > \.agent-panel-view \{\s*\n\s*flex: 1;\s*\n\s*min-height: 0;/u,
+  );
+  assert.doesNotMatch(css, /\n\.file-panel > \.thread-body \{/u);
+});

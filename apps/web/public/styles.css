@@ -9508,8 +9508,17 @@ body:has(.pcard-anchor:is(:hover, :focus-within))
   max-width: 100%;
   flex: none;
   position: relative;
-  display: grid;
-  grid-template-rows: auto 1fr auto;
+  /* A column, and the growing child says so rather than the position.
+     This was three named rows — `auto 1fr auto` — and the safe-area rule at
+     the foot of this file quietly replaced it with a flex column, for the
+     reason given there: anything inserted above the body took the flexible
+     row and the body was squeezed into `auto`. The grid stayed written here
+     long after nothing read it, which is worse than either — the row that
+     "stretches" is cited by `.agent-history` and by the panel's own comments,
+     and none of it had been true since. Said once, here, where the panel is
+     built; `.thread-panel > .thread-body` below is what actually grows. */
+  display: flex;
+  flex-direction: column;
   min-height: 0;
   /* Nothing here drops the panel under the channel banner any more, and
      nothing needs to: the banner is pinned across the top of the shell and
@@ -9523,6 +9532,20 @@ body:has(.pcard-anchor:is(:hover, :focus-within))
   border-radius: var(--radius-xl);
   box-shadow: -14px 0 30px -24px rgb(0 0 0 / 60%);
   z-index: 4;
+}
+
+/* Whichever child is the panel's scroller, it is the one that grows.
+ *
+ * Only the file panel was named here, and every other panel — the thread, the
+ * pins, a person, a branch, the catch-up — was left hugging its content: the
+ * body stopped at its last line and the composer came to rest under it,
+ * halfway up an empty panel, while the room's own composer sat on the floor.
+ * Naming one panel was the bug; the growing row is a property of the shape
+ * every one of them shares, so it is written against that shape. */
+.thread-panel > .thread-body,
+.agent-detail-panel > .agent-panel-view {
+  flex: 1;
+  min-height: 0;
 }
 
 /* The gutter the shell used to hand out to everybody. The navigation and the
@@ -13534,19 +13557,13 @@ dialog.modal[open]::backdrop {
 .thread-panel,
 .file-panel {
   padding-top: var(--safe-top);
-  /* A column rather than the panel's three named rows.
-     `grid-template-rows: auto 1fr auto` fills in order, so anything inserted
-     above the body takes the flexible row and the editor is squeezed into
-     `auto` — which is exactly what the holders banner did: chips floating in
-     the middle of an empty panel and two lines of source at the bottom.
-     Flex says which child grows instead of which position does. */
+  /* A column rather than named rows, for the reason `.thread-panel` gives
+     where it is built: `grid-template-rows` fills in order, so anything
+     inserted above the body takes the flexible row and the body is squeezed
+     into `auto`. Repeated here only for `.chan-sidebar`, which is not a
+     panel; the panels already say it themselves. */
   display: flex;
   flex-direction: column;
-}
-
-.file-panel > .thread-body {
-  flex: 1;
-  min-height: 0;
 }
 
 /* The home indicator, and on iOS Safari the floating address bar, overlap the
