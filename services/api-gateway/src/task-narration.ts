@@ -422,6 +422,51 @@ export function isVendorSignInFailure(error: string): boolean {
 }
 
 /**
+ * The vendor's way of saying the request arrived carrying nothing at all.
+ *
+ * "Missing bearer or basic authentication in header" is not an expired
+ * sign-in and reading it as one is worse than saying nothing: it names a
+ * remedy — sign in again — for an account that was never refused, and the
+ * person carries it out, is told they are connected, and watches the next run
+ * fail exactly as before. What actually happened is that the CLI had no
+ * credential on hand to send, which is a different repair in a different
+ * place.
+ *
+ * Both readings are 401s and the vendors do not agree on the wording, so this
+ * matches the phrases that can only mean absence. Anything else that trips
+ * {@link IS_AUTH_FAILURE_RE} keeps the expiry reading, which is the common
+ * case and the safer default: telling somebody a working sign-in has lapsed
+ * wastes a minute, while telling somebody with a lapsed one that nothing was
+ * sent sends them looking for a connection that is already there.
+ */
+const NO_CREDENTIAL_SENT_RE =
+  /Missing bearer(?: or basic authentication)?|\bNot logged in\b|no (?:api[- ]?key|credentials?) (?:was |were )?(?:provided|found)|missing (?:api[- ]?key|credentials?|authorization header)/iu;
+
+export function isMissingVendorCredential(error: string): boolean {
+  return (
+    isVendorSignInFailure(error) && NO_CREDENTIAL_SENT_RE.test(error)
+  );
+}
+
+/**
+ * What to say when the CLI had nothing to send.
+ *
+ * Deliberately does not name a single repair. Which one is right depends on
+ * how this deployment runs its agents, and the one thing that is certain from
+ * here is the shape of the fault: the account is not the problem, the
+ * connection to it is.
+ */
+export function missingCredentialRemedy(): string {
+  return localAgentsOnly()
+    ? "My CLI on the machine running the Kumi app is not signed in to " +
+        "anything — it sent no credentials at all, so this is not an account " +
+        "that lapsed. Sign that CLI in there however you normally would, then " +
+        "send this again."
+    : "Reconnect me from Settings → Agents — my sign-in is not lapsed, it is " +
+        "missing, so nothing reached the CLI to be refused.";
+}
+
+/**
  * What each integration outcome means, said plainly.
  *
  * The integration path records its outcome as a status and an explanation
@@ -447,6 +492,15 @@ export const INTEGRATION_FAILURE_REASONS: Record<string, string> = {
  * a momentary model error read as abandoned work.
  */
 export function explainAnswerFailure(error?: string): string {
+  if (isMissingVendorCredential(error ?? "")) {
+    return (
+      `I could not answer that — ${missingCredentialRemedy()}` +
+      `\n\nWhat I got back: ${clipToBoundary(
+        (error ?? "").replace(/\s+/gu, " ").trim(),
+        FAILURE_DETAIL_MAX,
+      )}`
+    );
+  }
   if (isVendorSignInFailure(error ?? "")) {
     // Carrying the evidence, for the reason `explainTaskFailure` does.
     return (
@@ -587,6 +641,15 @@ export function splitAgentAccount(detail: string): {
 }
 
 export function explainTaskFailure(error: string, status?: string): string {
+  if (isMissingVendorCredential(error)) {
+    return (
+      `I could not finish this — ${missingCredentialRemedy()}` +
+      `\n\nWhat I got back: ${clipToBoundary(
+        error.replace(/\s+/gu, " ").trim(),
+        FAILURE_DETAIL_MAX,
+      )}`
+    );
+  }
   if (isVendorSignInFailure(error)) {
     // The interpretation, and then the evidence for it.
     //
