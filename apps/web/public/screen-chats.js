@@ -1950,7 +1950,7 @@ function chanSidebar(activeRepositoryId) {
          now scrolls together, the way the conversation beside it does, and
          each heading sticks to the top of the panel while its own section is
          passing so the reader always knows which list they are in. -->
-    <div class="chan-scroll">
+    <div class="chan-scroll" data-scroll-key="workspace-nav:${esc(activeRepositoryId)}">
       <!-- People and agents fold up under the channel list rather than
            vanishing with it. Each list is a clipping box around one inner
            block, which is the whole of what lets the stylesheet animate a
@@ -9761,7 +9761,18 @@ export function jumpToUnreadOrLatest() {
  * they had their eyes on. The offset is kept as the tie-breaker for the
  * scrollers whose rows carry no id, and for a message that has since gone.
  */
-const SCROLL_SURFACES = ["#chan-messages", ".thread-body"];
+const SCROLL_SURFACES = [
+  "#chan-messages",
+  ".thread-body",
+  // The navigation, the file tree and the private chat scroll too, and a
+  // render nobody asked for reset all three to the top. That is the same
+  // fault the two above were written for, and there was no reason beyond
+  // history that it stopped at two: a poll tick landing while somebody was
+  // halfway down a long channel list took them back to its first row.
+  ".chan-scroll",
+  ".tree-pane",
+  ".chat-pane",
+];
 
 /**
  * Every surface a selector finds, not just the first one.

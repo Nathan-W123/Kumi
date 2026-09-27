@@ -257,7 +257,11 @@ function treeNode(node, depth) {
 
 function treePane() {
   const entries = treeEntries();
-  return `<aside class="tree-pane${state.treeQuery === undefined ? "" : " filtering"}">
+  // Keyed, because this one's class is not stable: it gains `filtering` the
+  // moment somebody types in the box above it, and a restore that paired on
+  // the class list would be skipped on exactly the renders a search causes.
+  return `<aside class="tree-pane${state.treeQuery === undefined ? "" : " filtering"}"
+    data-scroll-key="tree-pane">
     <header class="tree-head">
       <span>Files</span>
       <span class="spacer"></span>

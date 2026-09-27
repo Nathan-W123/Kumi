@@ -478,3 +478,36 @@ test("a picture landing late moves nothing and replays nothing", async () => {
     /"load",\n {4}\(\) => \{\n {6}if \(followingChannel\) \{[\s\S]*?cancelFollowSettle\(\);\n {8}list\.scrollTop = list\.scrollHeight;/u,
   );
 });
+
+test("every scroller a render throws away is put back, not only the two", async () => {
+  // A render replaces the whole tree, so every scroller in it starts again at
+  // the top. Two were captured and restored; the navigation, the file tree
+  // and the private chat were not, and a poll tick landing while somebody was
+  // halfway down a long channel list took them back to its first row. That is
+  // the "it scrolled up on its own" nobody could reproduce on demand, because
+  // what triggers it is somebody else's typing indicator.
+  const chats = await publicFile("screen-chats.js");
+  const code = await publicFile("screen-code.js");
+
+  for (const surface of [
+    '"#chan-messages"',
+    '".thread-body"',
+    '".chan-scroll"',
+    '".tree-pane"',
+    '".chat-pane"',
+  ]) {
+    assert.ok(
+      new RegExp(`const SCROLL_SURFACES = \\[[\\s\\S]*?${surface.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}[\\s\\S]*?\\];`, "u").test(chats),
+      `${surface} is not among the surfaces a render restores`,
+    );
+  }
+
+  // The tree pane pairs on a key rather than on its class list, because the
+  // class gains `filtering` the moment somebody types in the box above it —
+  // and a restore skipped on a search is a restore skipped on the renders
+  // that need it most.
+  assert.match(code, /data-scroll-key="tree-pane"/u);
+  // The navigation names the workspace it is listing, so switching workspace
+  // cannot drop one list's offset onto another's.
+  assert.match(chats, /class="chan-scroll" data-scroll-key="workspace-nav:\$\{esc\(activeRepositoryId\)\}"/u);
+});
